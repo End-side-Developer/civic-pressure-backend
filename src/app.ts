@@ -21,6 +21,7 @@ const corsOptions = {
   origin: [
     'http://localhost:3000',
     'http://localhost:3001',
+    "https://civic-pressure-frontend.vercel.app",
     process.env.FRONTEND_URL || '',
   ].filter(Boolean),
   credentials: true,
