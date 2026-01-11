@@ -325,6 +325,16 @@ export const createComplaint = async (req: Request, res: Response) => {
 
     await complaintsCollection.doc(complaintId).set(newComplaint);
 
+    // Send confirmation notification to user
+    await sendUserNotification(
+      req.user.uid,
+      'complaintUpdates',
+      'COMPLAINT_UPDATE',
+      'Complaint Submitted Successfully',
+      `Your complaint "${title}" has been submitted and is pending review.`,
+      complaintId
+    );
+
     // Generate and store embedding for duplicate detection (non-blocking)
     // Now includes location data for better semantic matching
     if (isModelReady()) {
@@ -452,7 +462,8 @@ export const updateComplaint = async (req: Request, res: Response) => {
     }
 
     // Add to status history if status changed
-    if (updates.status && updates.status !== complaint.status) {
+    const statusChanged = updates.status && updates.status !== complaint.status;
+    if (statusChanged && updates.status) {
       const statusUpdate: StatusHistoryItem = {
         status: updates.status,
         date: new Date(),
@@ -462,6 +473,22 @@ export const updateComplaint = async (req: Request, res: Response) => {
     }
 
     await complaintsCollection.doc(id).update(updateData);
+
+    // Send notification if status was changed
+    if (statusChanged && complaint.userId) {
+      const statusMessage = updates.status === 'REJECTED' 
+        ? `Your complaint "${complaint.title}" has been rejected. ${updates.rejectionReason ? `Reason: ${updates.rejectionReason}` : ''}`
+        : `Your complaint "${complaint.title}" status has been updated to: ${updates.status}`;
+      
+      await sendUserNotification(
+        complaint.userId,
+        'complaintUpdates',
+        'STATUS_CHANGE',
+        'Complaint Status Update',
+        statusMessage,
+        id
+      );
+    }
 
     // Regenerate embedding if title, description, category, or location changed
     if (isModelReady() && (updates.title || updates.description || updates.category || updates.location)) {
