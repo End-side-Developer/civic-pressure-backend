@@ -23,6 +23,40 @@ if (!GEMINI_API_KEY) {
 // Initialize Gemini with new SDK
 const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 
+// Retry configuration
+const MAX_RETRIES = 3;
+const INITIAL_DELAY_MS = 1000;
+
+/**
+ * Helper function to delay execution
+ */
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Check if an error is retryable (network errors, 503, overload, etc.)
+ */
+function isRetryableError(error: any): boolean {
+  const errorMessage = (error.message || '').toLowerCase();
+  const errorString = JSON.stringify(error).toLowerCase();
+  
+  return (
+    errorMessage.includes('fetch failed') ||
+    errorMessage.includes('network') ||
+    errorMessage.includes('timeout') ||
+    errorMessage.includes('econnreset') ||
+    errorMessage.includes('econnrefused') ||
+    errorMessage.includes('503') ||
+    errorMessage.includes('overloaded') ||
+    errorMessage.includes('unavailable') ||
+    errorString.includes('503') ||
+    errorString.includes('overloaded') ||
+    errorString.includes('unavailable') ||
+    error.code === 'ECONNRESET' ||
+    error.code === 'ECONNREFUSED' ||
+    error.code === 'ETIMEDOUT'
+  );
+}
+
 /**
  * Prompt template for improving complaint descriptions
  */
@@ -106,98 +140,130 @@ export async function improveDescription(
     };
   }
 
-  try {
-    // Build the prompt
-    const prompt = IMPROVEMENT_PROMPT
-      .replace('{sector}', sector || 'General')
-      .replace('{title}', title || 'Not provided')
-      .replace('{description}', description.trim());
+  // Build the prompt
+  const prompt = IMPROVEMENT_PROMPT
+    .replace('{sector}', sector || 'General')
+    .replace('{title}', title || 'Not provided')
+    .replace('{description}', description.trim());
 
-    console.log('🤖 AI Service: Generating improved description...');
-    console.log('   Description length:', description.trim().length);
-    console.log('   Sector:', sector || 'General');
-    console.log('   Title:', title || 'Not provided');
+  let lastError: any = null;
 
-    // Use Gemini 3 Pro Preview with new SDK
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: prompt }],
+  // Retry loop with exponential backoff
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`🤖 AI Service: Generating improved description (attempt ${attempt}/${MAX_RETRIES})...`);
+      console.log('   Description length:', description.trim().length);
+      console.log('   Sector:', sector || 'General');
+      console.log('   Title:', title || 'Not provided');
+
+      // Use Gemini 3 Pro Preview with new SDK
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-pro-preview',
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: prompt }],
+          },
+        ],
+        config: {
+          temperature: 0.4,
+          topK: 40,
+          topP: 0.95,
+          maxOutputTokens: 2048,
         },
-      ],
-      config: {
-        temperature: 0.4,
-        topK: 40,
-        topP: 0.95,
-        maxOutputTokens: 2048,
-      },
-    });
+      });
 
-    const improvedText = response.text || '';
+      const improvedText = response.text || '';
 
-    console.log('✅ AI Service: Generation successful');
-    console.log('   Improved length:', improvedText.trim().length);
+      console.log('✅ AI Service: Generation successful');
+      console.log('   Improved length:', improvedText.trim().length);
 
-    if (!improvedText || improvedText.trim().length === 0) {
-      console.error('❌ AI Service: Empty response from Gemini');
+      if (!improvedText || improvedText.trim().length === 0) {
+        console.error('❌ AI Service: Empty response from Gemini');
+        return {
+          success: false,
+          error: 'AI generated empty response. Please try again.',
+          processingTimeMs: Date.now() - startTime,
+        };
+      }
+
       return {
-        success: false,
-        error: 'AI generated empty response. Please try again.',
+        success: true,
+        improvedDescription: improvedText.trim(),
         processingTimeMs: Date.now() - startTime,
       };
-    }
+    } catch (error: any) {
+      lastError = error;
+      console.error(`❌ AI Service Error (attempt ${attempt}/${MAX_RETRIES}):`);
+      console.error('   Error type:', error.constructor.name);
+      console.error('   Error message:', error.message);
+      console.error('   Error code:', error.code);
 
-    return {
-      success: true,
-      improvedDescription: improvedText.trim(),
-      processingTimeMs: Date.now() - startTime,
-    };
-  } catch (error: any) {
-    console.error('❌ AI Service Error Details:');
-    console.error('   Error type:', error.constructor.name);
-    console.error('   Error message:', error.message);
-    console.error('   Error code:', error.code);
-    console.error('   Full error:', error);
-    
-    // Log response details if available
-    if (error.response) {
-      console.error('   Response status:', error.response.status);
-      console.error('   Response data:', error.response.data);
-    }
+      // Check if error is retryable
+      if (isRetryableError(error) && attempt < MAX_RETRIES) {
+        const backoffDelay = INITIAL_DELAY_MS * Math.pow(2, attempt - 1);
+        console.log(`⏳ Retrying in ${backoffDelay}ms...`);
+        await delay(backoffDelay);
+        continue;
+      }
 
-    // Handle specific error types
-    if (error.message?.includes('SAFETY')) {
-      return {
-        success: false,
-        error: 'The description contains content that cannot be processed. Please revise and try again.',
-        processingTimeMs: Date.now() - startTime,
-      };
+      // Non-retryable error or last attempt, break out of loop
+      break;
     }
+  }
 
-    if (error.message?.includes('quota') || error.message?.includes('rate limit')) {
-      return {
-        success: false,
-        error: 'Service is temporarily busy. Please try again in a few moments.',
-        processingTimeMs: Date.now() - startTime,
-      };
-    }
+  // All retries exhausted, handle the last error
+  console.error('❌ AI Service Error Details (all retries exhausted):');
+  console.error('   Error type:', lastError?.constructor?.name);
+  console.error('   Error message:', lastError?.message);
+  console.error('   Error code:', lastError?.code);
+  console.error('   Full error:', lastError);
 
-    if (error.message?.includes('API key')) {
-      return {
-        success: false,
-        error: 'API key configuration error. Please contact support.',
-        processingTimeMs: Date.now() - startTime,
-      };
-    }
+  // Log response details if available
+  if (lastError?.response) {
+    console.error('   Response status:', lastError.response.status);
+    console.error('   Response data:', lastError.response.data);
+  }
 
+  // Handle specific error types
+  if (lastError?.message?.includes('SAFETY')) {
     return {
       success: false,
-      error: `Failed to improve description: ${error.message || 'Unknown error'}`,
+      error: 'The description contains content that cannot be processed. Please revise and try again.',
       processingTimeMs: Date.now() - startTime,
     };
   }
+
+  if (lastError?.message?.includes('quota') || lastError?.message?.includes('rate limit')) {
+    return {
+      success: false,
+      error: 'Service is temporarily busy. Please try again in a few moments.',
+      processingTimeMs: Date.now() - startTime,
+    };
+  }
+
+  if (lastError?.message?.includes('API key')) {
+    return {
+      success: false,
+      error: 'API key configuration error. Please contact support.',
+      processingTimeMs: Date.now() - startTime,
+    };
+  }
+
+  // Check if it was a retryable error (network/overload) that exhausted all retries
+  if (isRetryableError(lastError)) {
+    return {
+      success: false,
+      error: 'The AI service is currently unavailable after multiple attempts. You can continue with your own description - it looks great!',
+      processingTimeMs: Date.now() - startTime,
+    };
+  }
+
+  return {
+    success: false,
+    error: `Failed to improve description: ${lastError?.message || 'Unknown error'}`,
+    processingTimeMs: Date.now() - startTime,
+  };
 }
 
 /**
